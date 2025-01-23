@@ -27,10 +27,11 @@ use alloy::{
     providers::{ext::AnvilApi, Provider},
     rpc::types::anvil::MineOptions,
 };
-use anyhow::Result;
+use anyhow::{Ok, Result};
 use ethexe_common::{
     db::CodesStorage,
     events::{BlockEvent, MirrorEvent, RouterEvent},
+    gear::BlockCommitment,
 };
 use ethexe_db::{BlockMetaStorage, Database, MemDb, ScheduledTask};
 use ethexe_ethereum::{router::RouterQuery, Ethereum};
@@ -40,7 +41,7 @@ use ethexe_prometheus::PrometheusConfig;
 use ethexe_rpc::RpcConfig;
 use ethexe_runtime_common::state::{Storage, ValueWithExpiry};
 use ethexe_sequencer::Sequencer;
-use ethexe_signer::Signer;
+use ethexe_signer::{Signer, ToDigest};
 use ethexe_validator::Validator;
 use gear_core::{
     ids::prelude::*,
@@ -202,6 +203,313 @@ async fn ping() {
     assert_eq!(res.reply_code, ReplyCode::Success(SuccessReplyReason::Auto));
     assert_eq!(res.reply_payload, b"");
     assert_eq!(res.reply_value, 0);
+}
+
+// const RPC_URL: &str = "wss://ethereum-holesky-rpc.publicnode.com";
+const RPC_URL: &str = "wss://reth-rpc.gear-tech.io";
+const VALIDATOR_SECRET: &str = "0000000000000000000000000000000000000000000000000000000000000001";
+const ROUTER_ADDRESS: &str = "0x125afb19da286891d3040e1f5f6844e185c16797";
+
+fn secret_wallets() -> Vec<String> {
+    vec![]
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ntest::timeout(1200_000)]
+async fn create_new_router() {
+    gear_utils::init_default_logger();
+
+    let config = TestEnvConfig {
+        block_time: Duration::from_secs(12),
+        rpc_url: Some(RPC_URL.to_string()),
+        wallets: Some(secret_wallets()),
+        validators: ValidatorsConfig::Custom(vec![VALIDATOR_SECRET.to_string()]),
+        continuous_block_generation: true,
+        router_address: None,
+    };
+
+    let env = TestEnv::new(config).await.unwrap();
+
+    log::info!("📗 Router created: {:?}", env.router_address);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ntest::timeout(1200_000)]
+async fn upload_ping_code() {
+    gear_utils::init_default_logger();
+
+    let config = TestEnvConfig {
+        block_time: Duration::from_secs(12),
+        rpc_url: Some(RPC_URL.to_string()),
+        wallets: Some(secret_wallets()),
+        validators: ValidatorsConfig::Custom(vec![VALIDATOR_SECRET.to_string()]),
+        continuous_block_generation: true,
+        router_address: Some(ROUTER_ADDRESS.to_string()),
+    };
+
+    let mut env = TestEnv::new(config).await.unwrap();
+
+    let sequencer_public_key = env.wallets.next();
+    let mut node = env.new_node(
+        NodeConfig::default()
+            .sequencer(sequencer_public_key)
+            .validator(env.validators[0]),
+    );
+    node.start_service().await;
+
+    let res = env
+        .upload_code(demo_ping::WASM_BINARY)
+        .await
+        .unwrap()
+        .wait_for()
+        .await
+        .unwrap();
+    assert_eq!(res.code, demo_ping::WASM_BINARY);
+    assert!(res.valid);
+
+    let code_id = res.code_id;
+
+    let code = node
+        .db
+        .original_code(code_id)
+        .expect("After approval, the code is guaranteed to be in the database");
+    assert_eq!(code, demo_ping::WASM_BINARY);
+
+    let _ = node
+        .db
+        .instrumented_code(1, code_id)
+        .expect("After approval, instrumented code is guaranteed to be in the database");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ntest::timeout(1200_000)]
+async fn create_ping_program() {
+    gear_utils::init_default_logger();
+
+    let config = TestEnvConfig {
+        block_time: Duration::from_secs(12),
+        rpc_url: Some(RPC_URL.to_string()),
+        wallets: Some(secret_wallets()),
+        validators: ValidatorsConfig::Custom(vec![VALIDATOR_SECRET.to_string()]),
+        continuous_block_generation: true,
+        router_address: Some(ROUTER_ADDRESS.to_string()),
+    };
+
+    let mut env = TestEnv::new(config).await.unwrap();
+
+    let sequencer_public_key = env.wallets.next();
+    let mut node = env.new_node(
+        NodeConfig::default()
+            .sequencer(sequencer_public_key)
+            .validator(env.validators[0]),
+    );
+
+    // Should be taken from the transaction where the code was uploaded.
+    const TX_BLOB_HASH: &str = "0x8c8a87d62f19efe82d14c6c12c170eb6db449af8ae320615544081887c0aa358";
+
+    let code_id = env
+        .process_already_uploaded_code(demo_ping::WASM_BINARY, TX_BLOB_HASH)
+        .await;
+
+    let state = env
+        .ethereum
+        .router()
+        .query()
+        .code_state(code_id)
+        .await
+        .unwrap();
+    assert_eq!(state.into(), 2);
+
+    node.start_service().await;
+
+    let res = env
+        .create_program(code_id, b"PING", 0)
+        .await
+        .unwrap()
+        .wait_for()
+        .await
+        .unwrap();
+    assert_eq!(res.code_id, code_id);
+    assert_eq!(res.init_message_source, env.sender_id);
+    assert_eq!(res.init_message_payload, b"PING");
+    assert_eq!(res.init_message_value, 0);
+    assert_eq!(res.reply_payload, b"PONG");
+    assert_eq!(res.reply_value, 0);
+    assert_eq!(
+        res.reply_code,
+        ReplyCode::Success(SuccessReplyReason::Manual)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ntest::timeout(1200_000)]
+async fn simulate_empty_block_commitments() {
+    gear_utils::init_default_logger();
+
+    let config = TestEnvConfig {
+        block_time: Duration::from_secs(12),
+        rpc_url: Some(RPC_URL.to_string()),
+        wallets: Some(secret_wallets()),
+        validators: ValidatorsConfig::Custom(vec![VALIDATOR_SECRET.to_string()]),
+        continuous_block_generation: true,
+        router_address: Some(ROUTER_ADDRESS.to_string()),
+    };
+
+    let env = TestEnv::new(config).await.unwrap();
+
+    let mut listener = env.events_publisher().subscribe().await;
+
+    let mut previous_committed_block = env
+        .ethereum
+        .router()
+        .query()
+        .latest_committed_block_hash()
+        .await
+        .unwrap();
+
+    let mut data = listener
+        .apply_until(|event| match event {
+            Event::Block(data) => Ok(Some(data)),
+            _ => Ok(None),
+        })
+        .await
+        .unwrap();
+
+    let delay = 8;
+
+    loop {
+        let time = std::time::Instant::now();
+
+        let unix_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        log::trace!(
+            "Start processing block {}, ts {}, local ts {}",
+            data.header.height,
+            data.header.timestamp,
+            unix_time,
+        );
+
+        let rpc_delay = unix_time.saturating_sub(data.header.timestamp);
+        if rpc_delay > delay {
+            let mut new_data = listener
+                .apply_until(|event| match event {
+                    Event::Block(data) => Ok(Some(data)),
+                    _ => Ok(None),
+                })
+                .await
+                .unwrap();
+            while listener.len() != 0 {
+                match listener.next_event().await.unwrap() {
+                    Event::Block(data) => {
+                        new_data = data;
+                    }
+                    _ => {}
+                }
+            }
+            data = new_data;
+            continue;
+        }
+
+        tokio::time::sleep(Duration::from_secs(delay - rpc_delay)).await;
+
+        let commitment = BlockCommitment {
+            hash: data.hash,
+            timestamp: data.header.timestamp,
+            previous_committed_block,
+            predecessor_block: data.hash,
+            transitions: vec![],
+        };
+
+        let signature = ethexe_sequencer::agro::sign_commitments_digest(
+            vec![commitment.to_digest()].iter().collect(),
+            &env.signer,
+            env.validators[0],
+            env.ethereum.router().address(),
+        )
+        .unwrap();
+
+        log::trace!("Try to commit: {commitment:?} with signature: {signature:?}");
+        let tx = env
+            .ethereum
+            .router()
+            .commit_blocks(vec![commitment], vec![signature])
+            .await
+            .unwrap();
+        log::trace!("Commitment tx: {tx:?}");
+
+        let mut new_data = listener
+            .apply_until(|event| match event {
+                Event::Block(new_data) => {
+                    for event in &new_data.events {
+                        match event {
+                            BlockEvent::Router(RouterEvent::BlockCommitted { hash })
+                                if *hash == data.hash =>
+                            {
+                                return Ok(Some(new_data));
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(None)
+                }
+                _ => Ok(None),
+            })
+            .await
+            .unwrap();
+
+        log::trace!("Committed after: {}", time.elapsed().as_secs());
+        log::trace!(
+            "Committed minus first block height: {}",
+            new_data.header.height - data.header.height
+        );
+
+        while listener.len() != 0 {
+            match listener.next_event().await.unwrap() {
+                Event::Block(data) => {
+                    new_data = data;
+                }
+                _ => {}
+            }
+        }
+
+        previous_committed_block = data.hash;
+        data = new_data;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ntest::timeout(1200_000)]
+async fn collect_blocks_delay_statistic() {
+    gear_utils::init_default_logger();
+
+    let config = TestEnvConfig {
+        block_time: Duration::from_secs(12),
+        rpc_url: Some(RPC_URL.to_string()),
+        wallets: Some(secret_wallets()),
+        validators: ValidatorsConfig::Generated(0),
+        continuous_block_generation: true,
+        router_address: Some(ROUTER_ADDRESS.to_string()),
+    };
+
+    let env = TestEnv::new(config).await.unwrap();
+
+    let mut listener = env.events_publisher().subscribe().await;
+
+    loop {
+        let block_data = listener.next_block_event().await.unwrap();
+        log::info!(
+            "Block: {}, ts: {}, local ts {}",
+            block_data.header.height,
+            block_data.header.timestamp,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -964,7 +1272,7 @@ async fn multiple_validators() {
 
 mod utils {
     use super::*;
-    use ethexe_observer::SimpleBlockData;
+    use ethexe_observer::{BlockData, SimpleBlockData};
     use futures::StreamExt;
     use gear_core::message::ReplyCode;
     use std::{ops::Mul, str::FromStr};
@@ -1192,11 +1500,13 @@ mod utils {
             self.blob_reader
                 .add_blob_transaction(blob_tx, code.to_vec())
                 .await;
-            let _tx_hash = self
+            let tx_hash = self
                 .ethereum
                 .router()
                 .request_code_validation(code_id, blob_tx)
                 .await?;
+
+            log::info!("Code uploaded, tx hash {tx_hash}, blob tx {blob_tx}");
 
             Ok(WaitForUploadCode { listener, code_id })
         }
@@ -1442,6 +1752,15 @@ mod utils {
             self.receiver.recv().await.map_err(Into::into)
         }
 
+        pub async fn next_block_event(&mut self) -> Result<BlockData> {
+            loop {
+                let event = self.next_event().await?;
+                if let Event::Block(block) = event {
+                    return Ok(block);
+                }
+            }
+        }
+
         pub async fn apply_until<R: Sized>(
             &mut self,
             mut f: impl FnMut(Event) -> Result<Option<R>>,
@@ -1480,6 +1799,11 @@ mod utils {
                     }
                 }
             }
+        }
+
+        // Received but not consumed events count.
+        pub fn len(&self) -> usize {
+            self.receiver.len()
         }
     }
 

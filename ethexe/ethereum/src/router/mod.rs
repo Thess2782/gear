@@ -160,14 +160,26 @@ impl Router {
         commitments: Vec<CodeCommitment>,
         signatures: Vec<LocalSignature>,
     ) -> Result<H256> {
+        let max_priority_fee_per_gas = self.instance.provider().get_max_priority_fee_per_gas().await?;
+        log::trace!("max priority fee per gas {max_priority_fee_per_gas}");
+        log::trace!("blob base fee {}", self.instance.provider().get_blob_base_fee().await?);
         let builder = self.instance.commitCodes(
             commitments.into_iter().map(Into::into).collect(),
             signatures
                 .into_iter()
                 .map(|signature| Bytes::copy_from_slice(signature.as_ref()))
                 .collect(),
-        );
-        let receipt = builder.send().await?.try_get_receipt().await?;
+        ).max_priority_fee_per_gas(1000 * max_priority_fee_per_gas);
+
+
+        let time = std::time::Instant::now();
+        let x = builder.send().await?;
+        log::trace!("commitment tx sent time: {:?}", time.elapsed().as_secs());
+
+        let time = std::time::Instant::now();
+        let receipt = x.try_get_receipt().await?;
+        log::trace!("receipt received time: {:?}", time.elapsed().as_secs());
+
         Ok(H256(receipt.transaction_hash.0))
     }
 
@@ -185,9 +197,11 @@ impl Router {
                     .map(|signature| Bytes::copy_from_slice(signature.as_ref()))
                     .collect(),
             )
-            .gas(10_000_000);
-        let receipt = builder.send().await?.try_get_receipt().await?;
-        Ok(H256(receipt.transaction_hash.0))
+            .gas(10_000_000)
+            .max_priority_fee_per_gas(1_000_000_000);
+        let pending = builder.send().await?;
+        let tx = *pending.inner().tx_hash();
+        Ok(H256(tx.0))
     }
 }
 

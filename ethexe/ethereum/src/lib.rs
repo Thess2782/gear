@@ -51,7 +51,7 @@ use mirror::Mirror;
 use router::{Router, RouterQuery};
 use std::{sync::Arc, time::Duration};
 
-mod abi;
+pub mod abi;
 mod eip1167;
 pub mod mirror;
 pub mod router;

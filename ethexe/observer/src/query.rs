@@ -202,6 +202,10 @@ impl Query {
 
     pub async fn get_last_committed_chain(&mut self, block_hash: H256) -> Result<Vec<H256>> {
         let current_block = self.get_block_header_meta(block_hash).await?;
+
+        let x = self.get_committed_blocks(block_hash).await?;
+        log::info!("Committed blocks: {x:?}");
+
         let latest_valid_block_height = self
             .database
             .latest_valid_block()
